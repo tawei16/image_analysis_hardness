@@ -6,10 +6,58 @@ import pytesseract
 import os
 import sys
 
-# Hardcode the local engine pointer before executing any OCR tasks
-# Adjust this path as needed for your local environment
-if os.path.exists(r'C:\tesseract.exe'):
-    pytesseract.pytesseract.tesseract_cmd = r'C:\tesseract.exe'
+class Logger:
+    LEVELS = {"DEBUG": 0, "INFO": 1, "ERROR": 2}
+
+    def __init__(self, level="INFO"):
+        self.level = self.LEVELS.get(level.upper(), 1)
+        self.log_lines = []
+
+    def debug(self, msg):
+        if self.level <= 0:
+            print(f"[DEBUG] {msg}")
+        self.log_lines.append(f"[DEBUG] {msg}")
+
+    def info(self, msg):
+        if self.level <= 1:
+            print(f"[INFO] {msg}")
+        self.log_lines.append(f"[INFO] {msg}")
+
+    def error(self, msg):
+        if self.level <= 2:
+            print(f"[ERROR] {msg}")
+        self.log_lines.append(f"[ERROR] {msg}")
+
+def load_config(filepath="config.txt"):
+    config = {
+        "TESSERACT_PATH": r"C:\tesseract.exe",
+        "MIN_INDENT_SIZE_UM": 10.0,
+        "MIN_INTERSECT_ANGLE_DEG": 30.0,
+        "USE_ASTM": True,
+        "USE_ISO": True,
+        "DEFAULT_SCALE_UM_PX": 1.0,
+        "DEBUG_LEVEL": "INFO"
+    }
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            for line in f:
+                if "=" in line:
+                    key, val = line.strip().split("=", 1)
+                    if key in ["MIN_INDENT_SIZE_UM", "MIN_INTERSECT_ANGLE_DEG", "DEFAULT_SCALE_UM_PX"]:
+                        config[key] = float(val)
+                    elif key in ["USE_ASTM", "USE_ISO"]:
+                        config[key] = val.lower() == "true"
+                    else:
+                        config[key] = val
+    return config
+
+# Load configuration and initialize logger
+config = load_config()
+logger = Logger(level=config.get("DEBUG_LEVEL", "INFO"))
+
+# Configure tesseract path from config
+if os.path.exists(config["TESSERACT_PATH"]):
+    pytesseract.pytesseract.tesseract_cmd = config["TESSERACT_PATH"]
 
 def step1_image_data_loader(image_path):
     """STEP 1: IMAGE DATA LOADER"""
@@ -42,7 +90,7 @@ def step1_image_data_loader(image_path):
         
     return img
 
-def step2_dynamic_scale_calibration(img):
+def step2_dynamic_scale_calibration(img, config):
     """STEP 2: DYNAMIC SCALE CALIBRATION"""
     print("[STEP 2] Calibrating scale...")
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -81,12 +129,16 @@ def step2_dynamic_scale_calibration(img):
             if user_val.strip():
                 return float(user_val)
             else:
-                physical_um = float(input("Enter scale physical length (um): "))
+                user_um = input("Enter scale physical length (um) [or leave blank for default]: ")
+                if not user_um.strip():
+                    return config.get("DEFAULT_SCALE_UM_PX", 1.0)
+                physical_um = float(user_um)
                 pixel_len = float(input("Enter scale pixel length: "))
                 return physical_um / pixel_len
         except ValueError:
-            print("[ERROR] Invalid input. Defaulting to 1.0 um/px (UNRELIABLE).")
-            return 1.0
+            default_val = config.get("DEFAULT_SCALE_UM_PX", 1.0)
+            print(f"[ERROR] Invalid input. Defaulting to {default_val} um/px.")
+            return default_val
 
     c_factor = physical_value / pixel_width
     print(f"[INFO] Step 2 Calibration: {pixel_width} px = {physical_value} um ({c_factor:.4f} um/px)")
@@ -220,9 +272,12 @@ def calculate_indent_geometry(contour, c_factor):
 
     return d1_um, d2_um, angle1, angle2, intersect_angle
 
-def step6_vickers_geometric_diamond_diagnostics(indent_data, c_factor):
+def step6_vickers_geometric_diamond_diagnostics(indent_data, c_factor, config):
     """STEP 6: VICKERS GEOMETRIC DIAMOND DIAGNOSTICS"""
     print("[STEP 6] Running diamond diagnostics...")
+    min_size = config.get("MIN_INDENT_SIZE_UM", 10.0)
+    min_angle = config.get("MIN_INTERSECT_ANGLE_DEG", 30.0)
+
     for pt in indent_data:
         d1, d2, ang1, ang2, intersect = calculate_indent_geometry(pt['contour'], c_factor)
         pt.update({
@@ -231,23 +286,27 @@ def step6_vickers_geometric_diamond_diagnostics(indent_data, c_factor):
         })
 
         # Quality Filters
-        if not (d1 >= 10.0 and d2 >= 10.0):
-            pt["status"] = "REJECT (<10um)"
-        elif not (intersect > 30.0):
-            pt["status"] = "REJECT (Angle <=30deg)"
+        if not (d1 >= min_size and d2 >= min_size):
+            pt["status"] = f"REJECT (<{min_size}um)"
+        elif not (intersect > min_angle):
+            pt["status"] = f"REJECT (Angle <={min_angle}deg)"
         else:
             pt["status"] = "ACCEPT"
 
     return indent_data
 
-def step7_astm_iso_standard_compliance_validation(indent_data):
+def step7_astm_iso_standard_compliance_validation(indent_data, config):
     """STEP 7: ASTM E384 / ISO 6507-1 STANDARD COMPLIANCE VALIDATION"""
     print("[STEP 7] Validating standard compliance...")
+    use_astm = config.get("USE_ASTM", True)
+    use_iso = config.get("USE_ISO", True)
+
+    # Standard 2.5d rule for edge distance
     for pt in indent_data:
         if pt["status"] == "ACCEPT":
-            # 2.5d rule: distance to edge must be >= 2.5 * average diagonal
-            if pt["dist_um"] < 2.5 * pt["avg_d_um"]:
-                pt["status"] = "REJECT (Too close to edge)"
+            if use_astm or use_iso:
+                if pt["dist_um"] < 2.5 * pt["avg_d_um"]:
+                    pt["status"] = "REJECT (Too close to edge)"
     return indent_data
 
 def step8_output_asset_generation_log_appender(image_path, img, indent_data, log_lines, border_model):
@@ -333,16 +392,39 @@ def step8_output_asset_generation_log_appender(image_path, img, indent_data, log
         print("NO QUALIFIED POINTS FOUND")
 
 def process_hardness_profile(image_path):
-    log_lines = [f"[STARTING] Processing file: {os.path.basename(image_path)}"]
+    logger.info(f"--- STARTING WORKFLOW for {os.path.basename(image_path)} ---")
 
+    logger.info("STEP 1: IMAGE DATA LOADER")
     img = step1_image_data_loader(image_path)
-    c_factor = step2_dynamic_scale_calibration(img)
+    logger.debug(f"Step 1 Output: img.shape={img.shape if img is not None else 'None'}")
+
+    logger.info("STEP 2: DYNAMIC SCALE CALIBRATION")
+    c_factor = step2_dynamic_scale_calibration(img, config)
+    logger.debug(f"Step 2 Output: c_factor={c_factor:.4f} um/px")
+
+    logger.info("STEP 3: EDGE CURVE LINEARITY REGRESSION (RSQ ENGINE)")
     edge_points, regression_results = step3_edge_curve_linearity_regression(img)
+    logger.debug(f"Step 3 Output: {len(edge_points)} edge points, Linear RSQ={regression_results['linear']['rsq']:.4f}, Quadratic RSQ={regression_results['quadratic']['rsq']:.4f}")
+
+    logger.info("STEP 4: SPECIMEN BORDER PROFILING & FITTING")
     border_model = step4_specimen_border_profiling_fitting(edge_points, regression_results)
+    logger.debug(f"Step 4 Output: border_model={border_model}")
+
+    logger.info("STEP 5: INDENTATION CENTER ISOLATION & DISTANCE MEASUREMENT")
     indent_data = step5_indentation_center_isolation_measurement(img, border_model, c_factor)
-    indent_data = step6_vickers_geometric_diamond_diagnostics(indent_data, c_factor)
-    indent_data = step7_astm_iso_standard_compliance_validation(indent_data)
-    step8_output_asset_generation_log_appender(image_path, img, indent_data, log_lines, border_model)
+    logger.debug(f"Step 5 Output: Found {len(indent_data)} indents")
+
+    logger.info("STEP 6: VICKERS GEOMETRIC DIAMOND DIAGNOSTICS")
+    indent_data = step6_vickers_geometric_diamond_diagnostics(indent_data, c_factor, config)
+    logger.debug(f"Step 6 Output: Processed {len(indent_data)} indents")
+
+    logger.info("STEP 7: ASTM E384 / ISO 6507-1 STANDARD COMPLIANCE VALIDATION")
+    indent_data = step7_astm_iso_standard_compliance_validation(indent_data, config)
+    logger.debug(f"Step 7 Output: Validated {len(indent_data)} indents")
+
+    logger.info("STEP 8: OUTPUT ASSET GENERATION & LOG APPENDER")
+    step8_output_asset_generation_log_appender(image_path, img, indent_data, logger.log_lines, border_model)
+    logger.info("--- WORKFLOW COMPLETE ---")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
